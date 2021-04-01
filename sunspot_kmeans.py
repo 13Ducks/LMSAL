@@ -96,25 +96,33 @@ def clean_image(w, calc_super, black_mask, m):
     masked_image &= thresh
     c = sorted(cnts, key=cv2.contourArea, reverse=True)[0]
 
-    if cv2.contourArea(c) < 50:
-        return (np.zeros(masked_image.shape, dtype=np.uint8), super_penumbra, quiet)
+    # if cv2.contourArea(c) < 50:
+    #     return (np.zeros(masked_image.shape, dtype=np.uint8), super_penumbra, quiet)
 
     if calc_super:
         cnts, hierarchy = cv2.findContours(
-            masked_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            masked_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
         )[-2:]
-        c = sorted(cnts, key=cv2.contourArea, reverse=True)[0]
-
-        ellipse = cv2.fitEllipse(c)
-        center, r, ang = ellipse
-        new_ellipse = (center, (r[0] * 2.7, r[1] * 2.7), ang)
-
         ellipse_mask = np.zeros(thresh.shape).astype(np.uint8)
         contour_mask = np.zeros(thresh.shape).astype(np.uint8)
 
-        # -1 thickness causes it to be filled in
-        cv2.ellipse(ellipse_mask, new_ellipse, 255, -1)
-        cv2.drawContours(contour_mask, [c], -1, 255, -1)
+        for c in cnts:
+            area = cv2.contourArea(cv2.convexHull(c))
+
+            x, y, w, h = cv2.boundingRect(c)
+            w_scale = w / thresh.shape[1]
+            h_scale = h / thresh.shape[0]
+
+            if (area / thresh.size) > 0.001 and min(w_scale, h_scale) / max(
+                w_scale, h_scale
+            ) > 0.25:
+                ellipse = cv2.fitEllipse(c)
+                center, r, ang = ellipse
+                new_ellipse = (center, (r[0] * 2.7, r[1] * 2.7), ang)
+
+                # -1 thickness causes it to be filled in
+                cv2.ellipse(ellipse_mask, new_ellipse, 255, -1)
+                cv2.drawContours(contour_mask, [c], -1, 255, -1)
 
         super_penumbra = ~contour_mask & ellipse_mask
         quiet = ~ellipse_mask
@@ -130,7 +138,7 @@ def clean_image(w, calc_super, black_mask, m):
 # In[69]:
 
 
-def create_pixels(masked_image):
+def create_pixels(masked_image, num_clusters):
     pixels = []
     pixels_loc = []
     for i in range(masked_image.shape[0]):
@@ -140,8 +148,7 @@ def create_pixels(masked_image):
                 pixels.append(d[data_bounds[0] : data_bounds[1]])
                 pixels_loc.append((i, j))
 
-    # potentially make larger
-    if len(pixels) < 100:
+    if len(pixels) <= num_clusters:
         return (None, None)
 
     pixels = np.stack(pixels, axis=0)
@@ -252,7 +259,7 @@ def run_clustering(
 ):
     masked_image, super_penumbra, quiet = clean_image(w, calc_super, black_mask, m)
     print("Done masking")
-    pixels, pixels_loc = create_pixels(masked_image)
+    pixels, pixels_loc = create_pixels(masked_image, num_clusters)
     print("Done creating pixels")
 
     if pixels is None:
@@ -290,7 +297,7 @@ black_mask[black] = 0
 m = a[np.where(a >= 0)].mean()
 a = cv2.medianBlur(a, 3)
 
-area_thresholds = [0.25, 0.75]
+area_thresholds = [0.3, 0.75]
 
 mask_umbra = a < (m * area_thresholds[0])
 mask_penumbra = (a > (m * area_thresholds[0])) & (a < (m * area_thresholds[1]))
