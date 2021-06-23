@@ -32,20 +32,20 @@ data_bounds = (first_wl_idx, last_wl_idx + 1)
 
 best = ps_wl_idx
 
-bounds = [0, mgii.data.shape[0]]
-for r in range(mgii.data.shape[0]):
-    if mgii.data[r].mean() > 0:
+data= np.flip(mgii.data, axis=0)
+bounds = [0, data.shape[0]]
+for r in range(data.shape[0]):
+    if data[r].mean() > 0:
         bounds[0] = r
         break
 
-for r in range(mgii.data.shape[0] - 1, 0, -1):
-    if mgii.data[r].mean() > 0:
+for r in range(data.shape[0] - 1, 0, -1):
+    if data[r].mean() > 0:
         bounds[1] = r
         break
 
 bounds[0] += 1
-data = mgii.data[bounds[0] : bounds[1], :, :]
-
+data = data[bounds[0]:bounds[1], :, :]
 
 def remove_outliers(data, m=3):
     d = np.abs(data - np.median(data))
@@ -60,11 +60,16 @@ import os
 import shutil
 
 dir_name = raster_filename[:-5]
-if os.path.exists(dir_name):
-    shutil.rmtree(dir_name)
-os.makedirs(dir_name)
+#if os.path.exists(dir_name):
+#    shutil.rmtree(dir_name)
+if not os.path.exists(dir_name):
+    os.makedirs(dir_name)
 
-
+with open("sunspot_data_info.txt", "a") as f:
+    f.write(dir_name + "\n")
+    f.write(str(mgii.wl[0]) + "\n")
+    f.write(str(mgii.wl[-1]) + "\n")
+    f.write(str(mgii.SPCSCL) + "\n\n")
 # In[68]:
 
 
@@ -94,6 +99,9 @@ def clean_image(w, calc_super, black_mask, m):
     )
 
     masked_image &= thresh
+
+    if len(cnts) == 0:
+        return (np.zeros(masked_image.shape, dtype=np.float32), super_penumbra, quiet)
     c = sorted(cnts, key=cv2.contourArea, reverse=True)[0]
 
     # if cv2.contourArea(c) < 50:
@@ -118,7 +126,7 @@ def clean_image(w, calc_super, black_mask, m):
             ) > 0.25:
                 ellipse = cv2.fitEllipse(c)
                 center, r, ang = ellipse
-                new_ellipse = (center, (r[0] * 2.7, r[1] * 2.7), ang)
+                new_ellipse = (center, (r[0] * 2.3, r[1] * 2.3), ang)
 
                 # -1 thickness causes it to be filled in
                 cv2.ellipse(ellipse_mask, new_ellipse, 255, -1)
@@ -129,7 +137,7 @@ def clean_image(w, calc_super, black_mask, m):
 
     if m is not None:
         masked_image &= m
-
+    masked_image &= black_mask
     masked_image = masked_image.astype(np.float32)
 
     return (masked_image, super_penumbra, quiet)
@@ -262,8 +270,8 @@ def run_clustering(
     pixels, pixels_loc = create_pixels(masked_image, num_clusters)
     print("Done creating pixels")
 
-    if pixels is None:
-        return None
+    if True: #pixels is None:
+        return (masked_image, super_penumbra, quiet, None)
 
     km, y_km = cluster(pixels, num_clusters)
     print("Done clustering")
@@ -323,6 +331,8 @@ kmap = np.zeros(
 kmap_sections = np.zeros(shape=[mgii.data.shape[0], mgii.data.shape[1], 1])
 kmap_sections.fill(-1)
 
+blank_sections = np.zeros(shape=[mgii.data.shape[0], mgii.data.shape[1]], dtype=np.float32)
+
 all_km = []
 bad_data = False
 
@@ -354,14 +364,16 @@ for i, m in enumerate(masks):
             black_mask,
         )
 
-    if res is None:
-        bad_data = True
-        break
-
     mask, sp, quiet, km = res
+    blank_sections[bounds[0]:bounds[1], :][(mask > 0) & (blank_sections[bounds[0]:bounds[1], :] == 0)] = (i+1)
 
-    if sp is not None and calculate_super:
-        res_masks.extend([sp, quiet])
+
+    if calculate_super:
+        if sp is not None:
+            res_masks.extend([sp, quiet])
+        # elif filenames[i] == "penumbra":
+        #    bad_data = True
+        #    break
 
     rgb = cv2.cvtColor(mask, cv2.COLOR_GRAY2RGB)
     rgb[mask > 0] = colors[i]
@@ -372,15 +384,19 @@ f, axes = plt.subplots(1, 3, figsize=(20, 7))
 axes[0].imshow(blank_image, aspect="auto")
 implot = axes[1].imshow(data[:, :, best], aspect="auto", cmap=mgii.cmap)
 implot.set_clim([0, climit])
-kmapplot = axes[2].imshow(kmap[:, :, 0], aspect="auto", cmap=mgii.cmap)
-kmapplot.set_clim([0, climit / 1.5])
-axes[2].set_ylim(bounds[::-1])
+kmapplot = axes[2].imshow(blank_sections, aspect="auto")
+# kmapplot.set_clim([0, climit / 1.5])
+# axes[2].set_ylim(bounds[::-1])
 plt.savefig(dir_name + "/segmented.png")
+
+full_data = np.zeros(shape=[mgii.data.shape[0], mgii.data.shape[1]], dtype=np.float32)
+full_data[bounds[0]:bounds[1], :] = data[:, :, best]
+data_mask = np.stack((full_data, blank_sections), axis=2)
 
 if not bad_data:
     save_filename = dir_name + "/" + "kmeans_data.jbl.gz"
-    sv.save(save_filename, kmap, kmap_sections, all_km, force=True)
-
+   # sv.save(save_filename, kmap, kmap_sections, all_km, force=True)
+    sv.save(dir_name + "/" + "masked_image.jbl.gz", data_mask, force=True)
 
 # In[85]:
 
