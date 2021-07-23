@@ -1,42 +1,57 @@
+from astropy.io.fits.util import first
 from iris_lmsalpy import extract_irisL2data, saveall as sv
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2
 import os, shutil
+import glob
 import sunpy.map
 from sunpy.net import Fido, attrs as a
 import astropy.units as u
 from astropy.coordinates import SkyCoord
-from datetime import datetime
-from scipy.ndimage import zoom
+from datetime import datetime, timedelta
 
 
 def run_masking(raster_filename):
-    dir_name = raster_filename[:-5]
+    dir_name = "all_images"
     if not os.path.exists(dir_name):
         os.makedirs(dir_name)
 
     iris_raster = extract_irisL2data.load(raster_filename, window_info=["Mg II k 2796"])
 
     mgii = iris_raster.raster["Mg II k 2796"]
+    first_null = 0
+    for i, t in enumerate(mgii.date_time_acq_ok):
+        if t == "-- ::":
+            first_null += 1
+        else:
+            break
 
-    other_data = download_other_data(mgii, dir_name)
+    last_null = -1
+    for i, t in enumerate(mgii.date_time_acq_ok[::-1]):
+        if t == "-- ::":
+            last_null -= 1
+        else:
+            break
+
+    # downloaded_files = {
+    #     "hmi": "/Users/aaryan/Documents/Code/LMSAL_HUB/iris_hub/all_images/other_data/hmi_m_45s_2019_04_09_04_58_30_tai_magnetogram.fits",
+    #     "aia304": "/Users/aaryan/Documents/Code/LMSAL_HUB/iris_hub/all_images/other_data/aia_lev1_304a_2019_04_09t04_57_29_13z_image_lev1.fits",
+    #     "aia1700": "/Users/aaryan/Documents/Code/LMSAL_HUB/iris_hub/all_images/other_data/aia_lev1_1700a_2019_04_09t04_57_40_73z_image_lev1.fits",
+    #     "aia4500": "/Users/aaryan/Documents/Code/LMSAL_HUB/iris_hub/all_images/other_data/aia_lev1_4500a_2019_04_09t05_00_05_68z_image_lev1.fits",
+    # }
+
+    other_data = download_other_data(mgii, dir_name, first_null, last_null)
     climit = 1.5 * mgii.data.mean() + 5
 
     epsilon = 1e-2
-    first_wl = 2794.00276664
-    last_wl = 2806.01988627
     ps_wl = 2810.58
 
     find_wl_idx = lambda wl: np.where(np.abs(mgii.wl - wl) < epsilon)[0][0]
-
-    first_wl_idx = find_wl_idx(first_wl)
-    last_wl_idx = find_wl_idx(last_wl)
     ps_wl_idx = find_wl_idx(ps_wl)
-    data_bounds = (first_wl_idx, last_wl_idx + 1)
     best = ps_wl_idx
 
-    data = np.flip(mgii.data, axis=0)
+    data = mgii.data
 
     bounds = [0, data.shape[0]]
     for r in range(data.shape[0]):
@@ -76,6 +91,9 @@ def run_masking(raster_filename):
     masks = [mask_umbra, mask_penumbra, mask_quiet, mask_quiet]
 
     res_masks = []
+    ellipse_mask = np.zeros(
+        shape=[orig_data.shape[0], orig_data.shape[1]], dtype=np.float32
+    )
     blank_sections = np.zeros(
         shape=[orig_data.shape[0], orig_data.shape[1]], dtype=np.float32
     )
@@ -90,13 +108,14 @@ def run_masking(raster_filename):
         else:
             res = mask_layer(w, i == 1, black_mask, None)
 
-        mask, sp, quiet = res
+        mask, sp, quiet, ellipse = res
         blank_sections[bounds[0] : bounds[1], :][
             (mask > 0) & (blank_sections[bounds[0] : bounds[1], :] == 0)
         ] = section_to_num[i]
 
         if sp is not None:
             res_masks.extend([sp, quiet])
+            ellipse_mask[bounds[0] : bounds[1], :] = ellipse
 
     full_data = np.zeros(
         shape=[orig_data.shape[0], orig_data.shape[1]], dtype=np.float32
@@ -116,75 +135,140 @@ def run_masking(raster_filename):
     full_data[bounds[0] : bounds[1], :] = data
 
     all_data = create_figure(
-        mgii, full_data, climit, other_data, blank_sections, dir_name
+        mgii,
+        full_data,
+        climit,
+        other_data,
+        blank_sections,
+        ellipse_mask,
+        dir_name,
+        first_null,
+        last_null,
+        shifted=False,
+        filename="/" + raster_filename[:-5] + ".png",
     )
 
-    del mgii
+    create_figure(
+        mgii,
+        full_data,
+        climit,
+        other_data,
+        blank_sections,
+        ellipse_mask,
+        dir_name,
+        first_null,
+        last_null,
+        shifted=True,
+        filename="/" + raster_filename[:-5] + "_shifted.png",
+    )
+
+    del iris_raster, mgii
 
     shutil.rmtree(f"{os.getcwd()}/{dir_name}/other_data/")
     return all_data
 
 
-def download_other_data(mgii, dir_name):
-    tt = mgii.date_time_acq_ok
+def find_files(begin, end, instrument, field, wl=None):
+    # should add logic for closest
+    begin = datetime.strptime(begin, "%Y-%m-%d %H:%M:%S")
+    end = datetime.strptime(end, "%Y-%m-%d %H:%M:%S")
 
-    result_hmi = Fido.search(
-        a.Time(tt[0], tt[-1]), a.Instrument.hmi, a.Physobs.los_magnetic_field
-    )
-    result_aia304 = Fido.search(
-        a.Time(tt[0], tt[-1]),
-        a.Instrument.aia,
-        a.Physobs.intensity,
-        a.Wavelength(304 * u.angstrom),
-    )
-    result_aia1700 = Fido.search(
-        a.Time(tt[0], tt[-1]),
-        a.Instrument.aia,
-        a.Physobs.intensity,
-        a.Wavelength(1700 * u.angstrom),
-    )
-    result_aia4500 = Fido.search(
-        a.Time(tt[0], tt[-1]),
-        a.Instrument.aia,
-        a.Physobs.intensity,
-        a.Wavelength(4500 * u.angstrom),
-    )
+    if wl:
+        res = Fido.search(a.Time(begin, end), instrument, field, wl)
+    else:
+        res = Fido.search(a.Time(begin, end), instrument, field)
 
-    results = {
-        "hmi": result_hmi,
-        "aia304": result_aia304,
-        "aia1700": result_aia1700,
-        "aia4500": result_aia4500,
-    }
+    while res.file_num == 0:
+        begin -= timedelta(hours=12)
+        end += timedelta(hours=12)
+
+        print(f"begin {begin} end {end}")
+
+        if wl:
+            res = Fido.search(a.Time(begin, end), instrument, field, wl)
+        else:
+            res = Fido.search(a.Time(begin, end), instrument, field)
+
+    return res
+
+
+def download_other_data(mgii, dir_name, first_null, last_null, downloaded=False):
+    if not downloaded:
+        tt = mgii.date_time_acq_ok
+
+        begin = tt[first_null]
+        end = tt[last_null]
+
+        result_hmi = find_files(
+            begin, end, a.Instrument.hmi, a.Physobs.los_magnetic_field
+        )
+
+        result_aia304 = find_files(
+            begin,
+            end,
+            a.Instrument.aia,
+            a.Physobs.intensity,
+            a.Wavelength(304 * u.angstrom),
+        )
+        result_aia1700 = find_files(
+            begin,
+            end,
+            a.Instrument.aia,
+            a.Physobs.intensity,
+            a.Wavelength(1700 * u.angstrom),
+        )
+        result_aia4500 = find_files(
+            begin,
+            end,
+            a.Instrument.aia,
+            a.Physobs.intensity,
+            a.Wavelength(4500 * u.angstrom),
+        )
+
+        results = {
+            "hmi": result_hmi,
+            "aia304": result_aia304,
+            "aia1700": result_aia1700,
+            "aia4500": result_aia4500,
+        }
+    else:
+        results = downloaded
 
     submaps = {}
 
     for k, res in results.items():
         print(k)
-        closest = (None, float("inf"))
-        t = datetime.strptime(tt[len(tt) // 2], "%Y-%m-%d %H:%M:%S")
-        for i, r in enumerate(res._list[0]):
-            d = datetime.strptime(r["time"]["start"], "%Y%m%d%H%M%S")
-            diff = abs((d - t).total_seconds())
-            if diff < closest[1]:
-                closest = (i, diff)
-        downloaded_file = Fido.fetch(
-            res[0, closest[0]],
-            path=f"{os.getcwd()}/{dir_name}/other_data/",
-        )
+        if not downloaded:
+            closest = (None, float("inf"))
+            t = datetime.strptime(tt[len(tt) // 2], "%Y-%m-%d %H:%M:%S")
+            for i, r in enumerate(res._list[0]):
+                d = datetime.strptime(r["time"]["start"], "%Y%m%d%H%M%S")
+                diff = abs((d - t).total_seconds())
+                if diff < closest[1]:
+                    closest = (i, diff)
+            downloaded_file = Fido.fetch(
+                res[0, closest[0]],
+                path=f"{os.getcwd()}/{dir_name}/other_data/",
+                max_conn=1,
+            )
+        else:
+            downloaded_file = res
 
         full_map = sunpy.map.Map(downloaded_file)
 
         if k == "hmi":
             full_map = full_map.rotate(order=3)
 
+        first_x = mgii["XCENIX"][first_null]
+        last_x = mgii["XCENIX"][last_null]
+
         bottom_left = SkyCoord(
-            (mgii["XCENIX"][0]) * u.arcsec,
+            first_x * u.arcsec,
             ((mgii["YCEN"] - mgii.extent_arcsec_arcsec[3] / 2)) * u.arcsec,
             frame=full_map.coordinate_frame,
         )
         top_right = SkyCoord(
-            (mgii["XCENIX"][-1]) * u.arcsec,
+            last_x * u.arcsec,
             ((mgii["YCEN"] + mgii.extent_arcsec_arcsec[3] / 2)) * u.arcsec,
             frame=full_map.coordinate_frame,
         )
@@ -205,6 +289,7 @@ def mask_layer(w, calc_super, black_mask, m):
     masked_image = cv2.morphologyEx(masked_image, cv2.MORPH_CLOSE, kernel, iterations=1)
     super_penumbra = None
     quiet = None
+    ellipse_mask = None
 
     thresh = masked_image.astype(np.uint8)
     cnts, hierarchy = cv2.findContours(
@@ -222,7 +307,12 @@ def mask_layer(w, calc_super, black_mask, m):
     masked_image &= thresh
 
     if len(cnts) == 0:
-        return (np.zeros(masked_image.shape, dtype=np.float32), super_penumbra, quiet)
+        return (
+            np.zeros(masked_image.shape, dtype=np.float32),
+            super_penumbra,
+            quiet,
+            ellipse_mask,
+        )
 
     c = sorted(cnts, key=cv2.contourArea, reverse=True)[0]
 
@@ -253,51 +343,41 @@ def mask_layer(w, calc_super, black_mask, m):
     masked_image &= black_mask
     masked_image = masked_image.astype(np.float32)
 
-    return (masked_image, super_penumbra, quiet)
+    return (masked_image, super_penumbra, quiet, ellipse_mask)
 
 
-def draw_contours_data(blank_sections, sections, data, color):
-    data_draw = data.data.copy()
-    for i in sections:
-        flipped = np.flip(np.where(blank_sections == i, 1, 0), axis=0)
-        flipped = zoom(
-            flipped,
-            (
-                data_draw.shape[0] / flipped.shape[0],
-                data_draw.shape[1] / flipped.shape[1],
-            ),
-        )
-        flipped = flipped.astype(np.uint8)
-        cnts, hierarchy = cv2.findContours(
-            flipped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
-        )[-2:]
-        cv2.drawContours(data_draw, cnts, -1, color, 1)
+def create_figure(
+    mgii,
+    full_data,
+    climit,
+    other_data,
+    blank_sections,
+    sp_mask,
+    dir_name,
+    first_null,
+    last_null,
+    shifted=False,
+    filename="/all_data.png",
+):
+    all_data = {
+        "iris": full_data,
+        "mask": blank_sections,
+        "sp_mask": sp_mask,
+        "mu": mgii.mu,
+    }
 
-    return data_draw
+    extent_heliox_helioy = mgii.extent_heliox_helioy
+    extent_heliox_helioy[0] = mgii["XCENIX"][first_null]
+    extent_heliox_helioy[1] = mgii["XCENIX"][last_null]
 
-
-def create_figure(mgii, full_data, climit, other_data, blank_sections, dir_name):
-    all_data = {"iris": full_data, "mask": blank_sections, "mu": mgii.mu}
-
-    aia4500_draw = draw_contours_data(
-        blank_sections, [1, 2], other_data["aia4500"], (0, 0, 0)
-    )
-    hmi_draw = draw_contours_data(
-        blank_sections, [3, 5], other_data["hmi"], (255, 255, 255)
-    )
-
-    to_draw = {"hmi": hmi_draw, "aia4500": aia4500_draw}
+    where = np.where((blank_sections == 1) | (blank_sections == 2), blank_sections, 0)
 
     fig, axes = plt.subplots(2, 3, figsize=(12, 8))
     axes = axes.flatten()
     order = ["aia1700", "aia304", "hmi", "aia4500"]
 
     im = axes[0].imshow(
-        full_data,
-        cmap=mgii.cmap,
-        extent=mgii.extent_arcsec_arcsec,
-        origin="lower",
-        interpolation="nearest",
+        full_data, cmap=mgii.cmap, extent=extent_heliox_helioy, origin="lower"
     )
     im.set_clim([0, climit])
     axes[0].set_title("iris")
@@ -306,37 +386,97 @@ def create_figure(mgii, full_data, climit, other_data, blank_sections, dir_name)
         submap = other_data[k]
         all_data[k] = submap.data
 
-        axes[i + 1].imshow(
+        im = axes[i + 1].imshow(
             submap.data,
             cmap=submap.cmap,
             norm=submap.plot_settings["norm"],
-            interpolation="nearest",
+            extent=extent_heliox_helioy,
+            origin="lower",
         )
         axes[i + 1].set_title(k)
 
-        if k in to_draw:
-            axes[i + 1].imshow(
-                to_draw[k],
-                cmap=submap.cmap,
-                norm=submap.plot_settings["norm"],
-                interpolation="nearest",
+        extent_use = extent_heliox_helioy
+        if shifted:
+            dx = submap.center.Tx.value - mgii.XCEN
+            dy = submap.center.Ty.value - mgii.YCEN
+
+            extent_use = [
+                extent_heliox_helioy[0] - dx,
+                extent_heliox_helioy[1] - dx,
+                extent_heliox_helioy[2] - dy,
+                extent_heliox_helioy[3] - dy,
+            ]
+
+        color = "#ff0000" if k == "hmi" else "#ffffff"
+
+        axes[i + 1].contour(
+            where,
+            levels=[1, 2],
+            extent=extent_use,
+            colors=[color],
+        )
+
+        if k == "hmi":
+            axes[i + 1].contour(
+                sp_mask,
+                levels=[1],
+                extent=extent_use,
+                colors=["#ff0000"],
             )
+            im.set_clim([-500, 500])
 
     axes[5].imshow(
-        blank_sections,
-        extent=mgii.extent_arcsec_arcsec,
-        origin="lower",
-        interpolation="nearest",
+        blank_sections, extent=extent_heliox_helioy, origin="lower", cmap="inferno"
     )
     axes[5].set_title("masks")
 
-    plt.suptitle(dir_name)
-    plt.savefig(dir_name + "/all_data.png")
+    plt.suptitle(filename[1:-4])
+    fig.text(0.5, 0.04, "Helioprojective Longitude [arcsec]", ha="center", va="center")
+    fig.text(
+        0.06,
+        0.5,
+        "Helioprojective Latitude [arcsec]",
+        ha="center",
+        va="center",
+        rotation="vertical",
+    )
+
+    plt.savefig(dir_name + filename)
 
     return all_data
 
 
 if __name__ == "__main__":
-    a, mu = run_masking("iris_l2_20190409_044820_3893010094_raster_t000_r00000.fits")
-    print(a)
-    print(mu)
+    # test = run_masking("iris_l2_20131120_141151_3883006146_raster_t000_r00000.fits")
+
+    # raise Exception("rip")
+    drive_loc = "/Volumes/AARYAN_PSSD/"
+
+    filenames = list(sorted(glob.glob(drive_loc + "iris*")))
+    all_data = {}
+    start = 29
+    filenames = filenames[start:]
+
+    curr = start
+
+    loaded = sv.load("all_data.jbl.gz")
+    if loaded:
+        all_data = loaded["all_data"]
+
+    for l in filenames:
+        f = l.split("/")[-1][:-3]
+        os.system(f"gzip -dc < {l} > ~/Documents/Code/LMSAL_HUB/iris_hub/{f}")
+        try:
+            data = run_masking(f)
+        except:
+            sv.save("all_data.jbl.gz", all_data, force=True)
+            raise
+
+        os.remove(f)
+        all_data[f[:-5]] = data
+
+        curr += 1
+        print(curr)
+        break
+
+    sv.save("all_data.jbl.gz", all_data, force=True)
